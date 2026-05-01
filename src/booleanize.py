@@ -69,3 +69,20 @@ def load_mushroom(path: str | Path = "mushroom/agaricus-lepiota.data",
 def predicate_mask(ds: BooleanizedDataset, name: str) -> np.ndarray:
     """Convenience: 1-D mask for a named predicate."""
     return ds.X[:, ds.name_to_col[name]]
+
+
+def train_test_split(ds: BooleanizedDataset,
+                     test_frac: float = 0.2,
+                     seed: int = 42) -> tuple[BooleanizedDataset, BooleanizedDataset]:
+    """Reproducible stratified-ish split sharing the same feature vocabulary."""
+    rng = np.random.default_rng(seed)
+    n = ds.X.shape[0]
+    idx = rng.permutation(n)
+    n_test = max(1, int(round(n * test_frac)))
+    test_idx  = idx[:n_test]
+    train_idx = idx[n_test:]
+    train = BooleanizedDataset(ds.X[train_idx], ds.y[train_idx],
+                               ds.feature_names, ds.name_to_col)
+    test  = BooleanizedDataset(ds.X[test_idx],  ds.y[test_idx],
+                               ds.feature_names, ds.name_to_col)
+    return train, test

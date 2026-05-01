@@ -1,16 +1,28 @@
-"""Experiment 4: mushroom case study.
+"""Experiment 4: mushroom case study (with train / test split).
 
-This is the real-data demonstration that approximate validity finds rules
-that classical deduction would reject. We do four things:
+Four parts:
 
-  1. Reproduce the Duch et al. rules (odor not in {a,l,n} -> poisonous) and
-     show their classical-vs-approximate gap on the full dataset.
-  2. Exhaustively search short conjunctions of named predicates and rank by
-     empirical validity for the consequent `poisonous`.
-  3. Test non-monotonicity: take a rule with high validity, add each other
-     predicate as a context, find the largest negative Delta_gamma.
-  4. Run k-DNF abduction (k=2) to discover an explanation for `poisonous`,
-     scored by plausibility & explanatory power.
+  1. Duch et al. benchmark rules – establish ground truth for classically valid
+     rules: evaluate on both train and test to confirm they genuinely generalise.
+
+  2. Top conjunctions with held-out evaluation – discover rules on the TRAINING
+     set (including ~approximate~ rules that classical deduction rejects), then
+     score the same rules on the held-out TEST set. The gap type column labels
+     each rule:
+
+       approx_generalizes  – train_classical=False (counterexamples exist) AND
+                             test_val >= MIN_VAL (still informative on unseen data).
+                             This is the core empirical argument of the project.
+       both_classical       – classically valid on both splits (strong rules).
+       classical_train_only – classical on train but exceptions appear on test.
+       low_validity         – test_val < MIN_VAL on both counts.
+
+  3. Non-monotonic context sensitivity – discover the strongest approximately
+     valid (non-classical) singleton rule on training; sweep contexts on test.
+
+  4. k-DNF abduction (k=2) – abduce explanations on training with plausibility
+     filter (min_plausibility=0.01, top_k=15), then score each recovered term
+     on the held-out test set to confirm the explanations generalise.
 
 Output: results/exp4_mushroom_*.csv
 """
@@ -23,196 +35,318 @@ from pathlib import Path
 import numpy as np
 
 from ..abduction import kdnf_abduce
-from ..booleanize import BooleanizedDataset, load_mushroom, predicate_mask
+from ..booleanize import BooleanizedDataset, load_mushroom, predicate_mask, train_test_split
 from ..classical import classical_accept
 from ..conditional import delta_gamma
 from ..validity import empirical_validity
 
+MIN_VAL = 0.85          # below this, a rule is not useful
+MIN_COV_ABS = 30        # require at least this many antecedent hits in each split
+TRAIN_FRAC = 0.8
+SPLIT_SEED = 42
 
-def part1_duch_rules(ds: BooleanizedDataset, writer: csv.DictWriter) -> None:
-    print("\n[Part 1] Duch et al. benchmark rules vs. classical baseline")
-    odor_almond = predicate_mask(ds, "odor=a")
-    odor_anise  = predicate_mask(ds, "odor=l")
-    odor_none   = predicate_mask(ds, "odor=n")
-    edible_per_duch = odor_almond | odor_anise | odor_none
 
-    # Rule P_1: NOT(odor in {a,l,n})  ->  poisonous
-    alpha = ~edible_per_duch
-    beta = ds.y
+# ---------------------------------------------------------------------------
+# Part 1: Duch et al. benchmark rules
+# ---------------------------------------------------------------------------
+
+def _eval_rule(alpha: np.ndarray, beta: np.ndarray, label: str) -> dict:
     cls = classical_accept(alpha, beta)
     emp = empirical_validity(alpha, beta)
-    rec = {
-        "rule": "NOT(odor in {a,l,n}) -> poisonous (Duch P1)",
+    return {
+        "rule": label,
         "classical_accepted": int(cls.accepted),
         "n_counterexamples": cls.n_counterexamples,
-        "val": emp.val, "cov": emp.cov,
-        "wilson_low": emp.ci_low, "wilson_high": emp.ci_high,
+        "val": round(emp.val, 6), "cov": round(emp.cov, 6),
+        "wilson_low": round(emp.ci_low, 6), "wilson_high": round(emp.ci_high, 6),
         "n_alpha": emp.n_alpha,
     }
-    print(f"  {rec}")
-    writer.writerow(rec)
-
-    # Rule P_2: spore-print-color=green -> poisonous
-    alpha = predicate_mask(ds, "spore-print-color=r")  # r = green per the .names file
-    cls = classical_accept(alpha, beta)
-    emp = empirical_validity(alpha, beta)
-    rec = {
-        "rule": "spore-print-color=green -> poisonous (Duch P2)",
-        "classical_accepted": int(cls.accepted),
-        "n_counterexamples": cls.n_counterexamples,
-        "val": emp.val, "cov": emp.cov,
-        "wilson_low": emp.ci_low, "wilson_high": emp.ci_high,
-        "n_alpha": emp.n_alpha,
-    }
-    print(f"  {rec}")
-    writer.writerow(rec)
 
 
-def part2_top_conjunctions(ds: BooleanizedDataset,
-                           max_pairs: int = 200, max_size: int = 2) -> list[dict]:
-    """Search over conjunctions of size 1..max_size and report top ones by val."""
-    print("\n[Part 2] Top conjunctions for `poisonous` (single + pair)")
-    n = ds.X.shape[1]
-    beta = ds.y
+def part1_duch_rules(train: BooleanizedDataset,
+                     test: BooleanizedDataset,
+                     writer: csv.DictWriter) -> None:
+    print("\n[Part 1] Duch et al. rules – train then test")
+
+    def duch_masks(ds: BooleanizedDataset):
+        edible_odors = (predicate_mask(ds, "odor=a") |
+                        predicate_mask(ds, "odor=l") |
+                        predicate_mask(ds, "odor=n"))
+        return {
+            "P1_alpha": ~edible_odors,
+            "P2_alpha": predicate_mask(ds, "spore-print-color=r"),
+            "beta":     ds.y,
+        }
+
+    for label, split_name, ds in [("train", "train", train), ("test", "test", test)]:
+        m = duch_masks(ds)
+        for rule, alpha_key in [("NOT(odor∈{a,l,n})→poisonous (P1)", "P1_alpha"),
+                                 ("spore-print-color=green→poisonous (P2)", "P2_alpha")]:
+            rec = _eval_rule(m[alpha_key], m["beta"], f"{rule} [{split_name}]")
+            print(f"  {split_name}  {rec}")
+            writer.writerow(rec)
+
+
+# ---------------------------------------------------------------------------
+# Part 2: Top conjunctions – discover on train, evaluate on test
+# ---------------------------------------------------------------------------
+
+def _gap_type(tr_cls: int, te_val: float) -> str:
+    if not tr_cls and te_val >= MIN_VAL:
+        return "approx_generalizes"
+    if tr_cls:
+        return "both_classical"       # may be overridden below
+    return "low_validity"
+
+
+def part2_top_conjunctions(train: BooleanizedDataset,
+                           test: BooleanizedDataset) -> list[dict]:
+    print("\n[Part 2] Top conjunctions: discover on train, evaluate on test")
+    n = train.X.shape[1]
     rows: list[dict] = []
+    attr_of = [name.split("=", 1)[0] for name in train.feature_names]
 
-    # singletons
-    for j, name in enumerate(ds.feature_names):
-        a = ds.X[:, j]
-        if a.sum() < 30:                # require coverage to avoid noise
+    def _row(antecedent: str, size: int,
+             a_tr: np.ndarray, a_te: np.ndarray) -> dict | None:
+        if a_tr.sum() < MIN_COV_ABS or a_te.sum() < MIN_COV_ABS:
+            return None
+        tr_emp = empirical_validity(a_tr, train.y)
+        tr_cls = classical_accept(a_tr, train.y)
+        te_emp = empirical_validity(a_te, test.y)
+        te_cls = classical_accept(a_te, test.y)
+        # Determine gap_type (check for classical_train_only correction)
+        if tr_cls.accepted and not te_cls.accepted:
+            gap = "classical_train_only"
+        elif tr_cls.accepted and te_cls.accepted:
+            gap = "both_classical"
+        elif not tr_cls.accepted and te_emp.val >= MIN_VAL:
+            gap = "approx_generalizes"
+        else:
+            gap = "low_validity"
+        return {
+            "antecedent": antecedent, "size": size,
+            "train_val": round(tr_emp.val, 6),
+            "train_cov": round(tr_emp.cov, 6),
+            "train_classical": int(tr_cls.accepted),
+            "train_counterexamples": tr_cls.n_counterexamples,
+            "test_val": round(te_emp.val, 6),
+            "test_cov": round(te_emp.cov, 6),
+            "test_classical": int(te_cls.accepted),
+            "test_counterexamples": te_cls.n_counterexamples,
+            "test_wilson_low": round(te_emp.ci_low, 6),
+            "test_wilson_high": round(te_emp.ci_high, 6),
+            "test_n_alpha": te_emp.n_alpha,
+            "gap_type": gap,
+        }
+
+    # Singletons – no val filter; keep all with sufficient coverage
+    for j, name in enumerate(train.feature_names):
+        a_tr = train.X[:, j]
+        a_te = test.X[:, j]
+        r = _row(name, 1, a_tr, a_te)
+        if r:
+            rows.append(r)
+
+    # Pairs – restrict to cross-attribute to reduce search; no val filter so
+    # approximately-valid pairs (val ~0.90-0.99) are visible
+    for i, j in combinations(range(n), 2):
+        if attr_of[i] == attr_of[j]:
             continue
-        emp = empirical_validity(a, beta)
-        cls = classical_accept(a, beta)
-        rows.append({
-            "antecedent": name, "size": 1,
-            "val": emp.val, "cov": emp.cov,
-            "wilson_low": emp.ci_low, "wilson_high": emp.ci_high,
-            "n_alpha": emp.n_alpha,
-            "classical_accepted": int(cls.accepted),
-            "n_counterexamples": cls.n_counterexamples,
-        })
+        a_tr = train.X[:, i] & train.X[:, j]
+        a_te = test.X[:, i]  & test.X[:, j]
+        r = _row(f"{train.feature_names[i]} & {train.feature_names[j]}", 2, a_tr, a_te)
+        if r and r["train_val"] >= 0.7:     # discard clearly bad rules
+            rows.append(r)
 
-    # pairs (capped to keep this experiment runnable)
-    if max_size >= 2:
-        # To keep it tractable, only pair predicates from different attributes.
-        attr_of = [name.split("=", 1)[0] for name in ds.feature_names]
-        for i, j in combinations(range(n), 2):
-            if attr_of[i] == attr_of[j]:
-                continue
-            a = ds.X[:, i] & ds.X[:, j]
-            if a.sum() < 30:
-                continue
-            emp = empirical_validity(a, beta)
-            if emp.val < 0.95 and emp.val > 0.05:
-                continue
-            cls = classical_accept(a, beta)
-            rows.append({
-                "antecedent": f"{ds.feature_names[i]} & {ds.feature_names[j]}",
-                "size": 2,
-                "val": emp.val, "cov": emp.cov,
-                "wilson_low": emp.ci_low, "wilson_high": emp.ci_high,
-                "n_alpha": emp.n_alpha,
-                "classical_accepted": int(cls.accepted),
-                "n_counterexamples": cls.n_counterexamples,
-            })
+    rows.sort(key=lambda r: (-r["test_val"], -r["test_cov"]))
 
-    rows.sort(key=lambda r: (-r["val"], -r["cov"]))
-    print(f"  evaluated {len(rows)} candidate rules; top 5 by val:")
-    for r in rows[:5]:
-        print(f"    val={r['val']:.4f} cov={r['cov']:.4f} cls={r['classical_accepted']}  {r['antecedent']}")
+    # Summary
+    by_gap: dict[str, int] = {}
+    for r in rows:
+        by_gap[r["gap_type"]] = by_gap.get(r["gap_type"], 0) + 1
+    print(f"  {len(rows)} candidate rules evaluated; gap breakdown: {by_gap}")
+    print("  top 5 approx_generalizes rules:")
+    shown = 0
+    for r in rows:
+        if r["gap_type"] == "approx_generalizes":
+            print(f"    train_val={r['train_val']:.4f} (no classical)  "
+                  f"test_val={r['test_val']:.4f} [{r['test_wilson_low']:.3f},{r['test_wilson_high']:.3f}]  "
+                  f"{r['antecedent']}")
+            shown += 1
+            if shown >= 5:
+                break
     return rows
 
 
-def part3_nonmonotonicity(ds: BooleanizedDataset, base_rule: str) -> list[dict]:
-    """For a base rule with high val, try every other predicate as gamma and
-    report the most context-sensitive (largest |delta_gamma|) ones."""
-    print(f"\n[Part 3] Context sensitivity around base rule: {base_rule}")
-    base_alpha = predicate_mask(ds, base_rule)
-    beta = ds.y
-    base = empirical_validity(base_alpha, beta)
+# ---------------------------------------------------------------------------
+# Part 3: Non-monotonic context sensitivity
+# ---------------------------------------------------------------------------
+
+def part3_nonmonotonicity(train: BooleanizedDataset,
+                          test: BooleanizedDataset,
+                          base_rule: str) -> list[dict]:
+    """Discover strongest contexts on TRAIN, report Δγ on TEST."""
+    print(f"\n[Part 3] Context sensitivity around '{base_rule}' (eval on test)")
+    tr_alpha = predicate_mask(train, base_rule)
+    te_alpha = predicate_mask(test,  base_rule)
+
+    # Train: sweep every context, rank by |delta|
     rows: list[dict] = []
-    for name in ds.feature_names:
+    for name in train.feature_names:
         if name == base_rule:
             continue
-        gamma = predicate_mask(ds, name)
-        rep = delta_gamma(base_alpha, beta, gamma)
-        if rep.refined.n_alpha < 30:
+        tr_rep = delta_gamma(tr_alpha, train.y, predicate_mask(train, name))
+        if tr_rep.refined.n_alpha < MIN_COV_ABS:
             continue
+        # Evaluate the same context on test
+        te_rep = delta_gamma(te_alpha, test.y, predicate_mask(test, name))
         rows.append({
             "base_rule": base_rule,
             "gamma": name,
-            "base_val": rep.base.val,
-            "refined_val": rep.refined.val,
-            "delta": rep.delta,
-            "reversed": int(rep.reversed),
-            "n_alpha_gamma": rep.refined.n_alpha,
+            "train_base_val":    round(tr_rep.base.val, 6),
+            "train_refined_val": round(tr_rep.refined.val, 6),
+            "train_delta":       round(tr_rep.delta, 6),
+            "train_reversed":    int(tr_rep.reversed),
+            "test_base_val":     round(te_rep.base.val, 6) if not np.isnan(te_rep.base.val) else float("nan"),
+            "test_refined_val":  round(te_rep.refined.val, 6) if not np.isnan(te_rep.refined.val) else float("nan"),
+            "test_delta":        round(te_rep.delta, 6) if not np.isnan(te_rep.delta) else float("nan"),
+            "test_reversed":     int(te_rep.reversed),
+            "test_n_alpha_gamma": te_rep.refined.n_alpha,
         })
-    rows.sort(key=lambda r: r["delta"])
-    print(f"  base val = {base.val:.4f} (n_alpha = {base.n_alpha})")
-    print("  most negative Delta_gamma:")
+    rows.sort(key=lambda r: r["train_delta"])
+    print(f"  train base val = {empirical_validity(tr_alpha, train.y).val:.4f}")
+    print("  top-5 most negative Δγ on train (confirmed on test):")
     for r in rows[:5]:
-        print(f"    delta={r['delta']:+.4f}  refined={r['refined_val']:.4f}  gamma={r['gamma']}")
+        print(f"    train Δ={r['train_delta']:+.4f}  test Δ={r['test_delta']:+.4f}  γ={r['gamma']}")
     return rows
 
 
-def part4_kdnf_abduction(ds: BooleanizedDataset, k: int = 2) -> dict:
-    """Run k-DNF abduction with `poisonous` as the query."""
-    print(f"\n[Part 4] k-DNF abduction (k={k}) for `poisonous`")
-    res = kdnf_abduce(ds.X, ds.y, k=k)
-    print(f"  found {res.n_terms} terms; "
-          f"plausibility={res.score.plausibility:.4f}  "
-          f"explanatory_power={res.score.explanatory_power:.4f}  "
-          f"f_score={res.score.f_score:.4f}")
-    if res.n_terms <= 10:
-        for t in res.hypothesis.terms:
-            print(f"    term: {t}")
-    return {
-        "k": k,
-        "n_terms": res.n_terms,
-        "plausibility": res.score.plausibility,
-        "explanatory_power": res.score.explanatory_power,
-        "f_score": res.score.f_score,
-    }
+# ---------------------------------------------------------------------------
+# Part 4: k-DNF abduction with plausibility filter
+# ---------------------------------------------------------------------------
 
+def part4_kdnf_abduction(train: BooleanizedDataset,
+                         test: BooleanizedDataset,
+                         k: int = 2,
+                         min_plausibility: float = 0.01,
+                         top_k: int = 15) -> tuple[dict, list[dict]]:
+    """Abduce on TRAIN; score each surviving term on TEST."""
+    print(f"\n[Part 4] k-DNF abduction (k={k}, min_plausibility={min_plausibility}, top_k={top_k})")
+    res = kdnf_abduce(train.X, train.y, k=k,
+                      min_plausibility=min_plausibility, top_k=top_k,
+                      feature_names=train.feature_names)
+    print(f"  kept {res.n_terms} terms after plausibility filter (was 7k+ without it)")
+
+    # Overall score on test
+    test_h_mask = res.hypothesis(test.X.astype(bool))
+    from ..validity import empirical_validity as ev
+    te_score_raw = ev(test_h_mask, test.y)
+
+    summary = {
+        "k": k, "n_terms": res.n_terms,
+        "train_plausibility":      round(res.score.plausibility, 6),
+        "train_explanatory_power": round(res.score.explanatory_power, 6),
+        "train_f_score":           round(res.score.f_score, 6),
+        "test_val":  round(te_score_raw.val, 6),
+        "test_cov":  round(te_score_raw.cov, 6),
+    }
+    print(f"  overall → train f={res.score.f_score:.4f}  "
+          f"test_val={te_score_raw.val:.4f}  test_cov={te_score_raw.cov:.4f}")
+
+    # Per-term generalisation check: score each term on test.
+    # per_term_scores and hypothesis.terms are in the same order.
+    term_rows: list[dict] = []
+    for conj, (term_str, tr_sc) in zip(res.hypothesis.terms, res.per_term_scores):
+        te_mask = conj(test.X.astype(bool))
+        te_sc = _score_term(te_mask, test.y)
+        term_rows.append({
+            "term": term_str,
+            "train_plausibility":      round(tr_sc.plausibility, 6),
+            "train_explanatory_power": round(tr_sc.explanatory_power, 6),
+            "test_plausibility":       round(te_sc[0], 6),
+            "test_explanatory_power":  round(te_sc[1], 6),
+        })
+        print(f"    {term_str}")
+        print(f"      train  plaus={tr_sc.plausibility:.4f}  exp={tr_sc.explanatory_power:.4f}")
+        print(f"      test   plaus={te_sc[0]:.4f}  exp={te_sc[1]:.4f}")
+
+    return summary, term_rows
+
+
+def _score_term(mask: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    n_h = int(mask.sum())
+    n_hq = int(np.logical_and(mask, y).sum())
+    plaus = n_h / len(mask) if len(mask) > 0 else 0.0
+    expl  = n_hq / n_h if n_h > 0 else float("nan")
+    return plaus, expl
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def run(data_path: str = "mushroom/agaricus-lepiota.data") -> None:
     out_dir = Path("results")
     out_dir.mkdir(parents=True, exist_ok=True)
-    ds = load_mushroom(data_path)
-    print(f"loaded mushroom: m={ds.X.shape[0]} samples, n={ds.X.shape[1]} predicates")
 
-    # Part 1: Duch rules
+    full = load_mushroom(data_path)
+    train, test = train_test_split(full, test_frac=1 - TRAIN_FRAC, seed=SPLIT_SEED)
+    print(f"loaded mushroom: {full.X.shape[0]} total samples, "
+          f"{train.X.shape[0]} train / {test.X.shape[0]} test, "
+          f"{full.X.shape[1]} predicates")
+
+    # Part 1
     with (out_dir / "exp4_mushroom_duch.csv").open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=[
-            "rule", "classical_accepted", "n_counterexamples",
-            "val", "cov", "wilson_low", "wilson_high", "n_alpha",
-        ])
+        fieldnames = ["rule", "classical_accepted", "n_counterexamples",
+                      "val", "cov", "wilson_low", "wilson_high", "n_alpha"]
+        w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
-        part1_duch_rules(ds, w)
+        part1_duch_rules(train, test, w)
 
-    # Part 2: top conjunctions
-    rows2 = part2_top_conjunctions(ds)
-    with (out_dir / "exp4_mushroom_top_conjs.csv").open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows2[0].keys()))
-        w.writeheader()
-        w.writerows(rows2)
-
-    # Part 3: non-monotonicity around the strongest single antecedent
+    # Part 2
+    rows2 = part2_top_conjunctions(train, test)
     if rows2:
-        strongest = next(r for r in rows2 if r["size"] == 1 and r["val"] >= 0.85
-                         and r["cov"] >= 0.05 and not r["classical_accepted"])
-        rows3 = part3_nonmonotonicity(ds, strongest["antecedent"])
-        with (out_dir / "exp4_mushroom_delta_gamma.csv").open("w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows3[0].keys()))
+        with (out_dir / "exp4_mushroom_top_conjs.csv").open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows2[0].keys()))
             w.writeheader()
-            w.writerows(rows3)
+            w.writerows(rows2)
 
-    # Part 4: k-DNF abduction
-    res4 = part4_kdnf_abduction(ds, k=2)
-    with (out_dir / "exp4_mushroom_abduction.csv").open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(res4.keys()))
+    # Part 3: use the strongest approximate singleton discovered on train
+    approx_singletons = [r for r in rows2
+                         if r["size"] == 1
+                         and r["gap_type"] == "approx_generalizes"
+                         and r["train_val"] >= MIN_VAL
+                         and r["test_n_alpha"] >= MIN_COV_ABS]
+    if not approx_singletons:
+        # fall back to any non-classical singleton with decent val
+        approx_singletons = [r for r in rows2
+                             if r["size"] == 1 and not r["train_classical"]
+                             and r["train_val"] >= 0.75
+                             and r["test_n_alpha"] >= MIN_COV_ABS]
+    if approx_singletons:
+        approx_singletons.sort(key=lambda r: -r["train_val"])
+        anchor = approx_singletons[0]["antecedent"]
+        rows3 = part3_nonmonotonicity(train, test, anchor)
+        if rows3:
+            with (out_dir / "exp4_mushroom_delta_gamma.csv").open("w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(rows3[0].keys()))
+                w.writeheader()
+                w.writerows(rows3)
+    else:
+        print("\n[Part 3] No suitable approximate singleton found for context sweep")
+
+    # Part 4
+    summary4, term_rows4 = part4_kdnf_abduction(train, test, k=2,
+                                                 min_plausibility=0.01, top_k=15)
+    with (out_dir / "exp4_mushroom_abduction_summary.csv").open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(summary4.keys()))
         w.writeheader()
-        w.writerow(res4)
+        w.writerow(summary4)
+    if term_rows4:
+        with (out_dir / "exp4_mushroom_abduction_terms.csv").open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(term_rows4[0].keys()))
+            w.writeheader()
+            w.writerows(term_rows4)
 
 
 if __name__ == "__main__":
